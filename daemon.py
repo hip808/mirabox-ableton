@@ -18,7 +18,12 @@ Layout (horizontal position follows Live's own track selection):
   Keys 1-4 / 6-9 -> fire clips. Top row = scene cursor's row, bottom row =
                   the next scene row. 4 tracks wide, starting at the track
                   selected in Live. Each key shows that clip's own colour and
-                  name from Session View.
+                  name from Session View, dimmed to 28% brightness when
+                  loaded but not playing -- full brightness means actually
+                  playing (or queued to start), near-black means empty. This
+                  updates live: firing a clip lights it immediately, and a
+                  Live-side listener confirms/corrects and reflects clips
+                  started or stopped from Live's own UI or ending on their own.
   Keys 5 / 10  -> scene launch for those same two rows -- the Main (Master)
                   track's column in Session view. They scroll with the clip
                   keys, and show each scene's name and colour.
@@ -106,6 +111,42 @@ ROW2_KEY_TO_COLUMN = {"bot1": 0, "bot2": 1, "bot3": 2, "bot4": 3}
 # same two rows the clip keys are showing.
 SCENE_KEY_LOGICAL = {"top5": 5, "bot5": 10}
 SCENE_DEFAULT_COLOR = (55, 55, 62)
+
+# Reverse lookups: column -> logical key, so a single clip's key image can be
+# redrawn on its own (e.g. right when it starts/stops playing) without a
+# full refresh of all 10 keys.
+COL_TO_ROW1_LOGICAL = {ROW1_KEY_TO_COLUMN[k]: v for k, v in ROW1_KEY_TO_LOGICAL.items()}
+COL_TO_ROW2_LOGICAL = {ROW2_KEY_TO_COLUMN[k]: v for k, v in ROW2_KEY_TO_LOGICAL.items()}
+ROW1_LOGICAL_TO_COL = {v: k for k, v in COL_TO_ROW1_LOGICAL.items()}
+ROW2_LOGICAL_TO_COL = {v: k for k, v in COL_TO_ROW2_LOGICAL.items()}
+
+# Loaded-but-stopped clips are dimmed to this fraction of their real color,
+# so at a glance: near-black = empty, dim = loaded, full brightness =
+# actually playing (or queued to start) -- the same convention Push and
+# other session-view controllers use.
+CLIP_DIM_FACTOR = 0.28
+
+# Triggered (queued to start, not yet playing) blinks between full and dim
+# rather than being lumped in with "playing" -- otherwise there's no way to
+# tell "about to play" apart from "already playing" at a glance.
+BLINK_HZ = 2.5
+
+
+def dim_color(rgb, factor=CLIP_DIM_FACTOR):
+    return tuple(max(0, int(round(c * factor))) for c in rgb)
+
+
+def clip_key_color(rgb, playing, triggered, blink_on, empty_color=None):
+    """The single place that turns (color, playing, triggered) into what
+    actually gets drawn: full brightness = playing, blinking = triggered
+    (queued, not yet playing), dim = loaded but idle, untouched = empty."""
+    if empty_color is not None and rgb == empty_color:
+        return rgb
+    if playing:
+        return rgb
+    if triggered:
+        return rgb if blink_on else dim_color(rgb)
+    return dim_color(rgb)
 
 STRIP_ZONE_LOGICAL = {1: 11, 2: 12, 3: 13, 4: 14}
 STRIP_W, STRIP_H = 176, 112
@@ -600,12 +641,27 @@ class State:
         self.track_names = ["--"] * KEY_COLUMNS
         self.clip_colors = [EMPTY_CLIP_COLOR] * KEY_COLUMNS
         self.clip_names = [""] * KEY_COLUMNS
+        self.clip_playing = [False] * KEY_COLUMNS
+        self.clip_triggered = [False] * KEY_COLUMNS
         self.row2_colors = [EMPTY_CLIP_COLOR] * KEY_COLUMNS
         self.row2_names = [""] * KEY_COLUMNS
+        self.row2_playing = [False] * KEY_COLUMNS
+        self.row2_triggered = [False] * KEY_COLUMNS
         self.row2_scene = 0
-        # [row1, row2] scene launch buttons on keys 5 and 10
+        # [row1, row2] scene launch buttons on keys 5 and 10. "Active" here
+        # means at least one of the 4 currently-visible tracks has that
+        # scene's clip playing/triggered -- reflects what's shown on the
+        # hardware right now, not the whole song's tracks.
         self.scene_names = ["", ""]
         self.scene_colors = [SCENE_DEFAULT_COLOR, SCENE_DEFAULT_COLOR]
+        self.scene_playing = [False, False]
+        self.scene_triggered = [False, False]
+
+    def recompute_scene_activity(self):
+        self.scene_playing[0] = any(self.clip_playing)
+        self.scene_triggered[0] = any(self.clip_triggered)
+        self.scene_playing[1] = any(self.row2_playing)
+        self.scene_triggered[1] = any(self.row2_triggered)
 
     def track_ids(self):
         return [self.base + i for i in range(KEY_COLUMNS) if self.base + i < self.num_tracks]
@@ -642,19 +698,25 @@ class State:
         ) if ids and self.row2_scene != self.scroll_scene else []
 
         def fetch_clips(has, scene):
-            idx, creqs, nreqs = [], [], []
+            idx, creqs, nreqs, preqs, treqs = [], [], [], [], []
             for i, tid in enumerate(ids):
                 h = has[i] if i < len(has) else None
                 if h and len(h) >= 3 and h[2]:
                     idx.append(i)
                     creqs.append(("/live/clip/get/color", [tid, scene]))
                     nreqs.append(("/live/clip/get/name", [tid, scene]))
+                    preqs.append(("/live/clip_slot/get/is_playing", [tid, scene]))
+                    treqs.append(("/live/clip_slot/get/is_triggered", [tid, scene]))
             colors = self.osc.query_many(creqs) if creqs else []
             cnames = self.osc.query_many(nreqs) if nreqs else []
-            return idx, colors, cnames
+            playing = self.osc.query_many(preqs) if preqs else []
+            triggered = self.osc.query_many(treqs) if treqs else []
+            return idx, colors, cnames, playing, triggered
 
-        idx1, colors1, names1 = fetch_clips(has1, self.scroll_scene)
-        idx2, colors2, names2 = fetch_clips(has2, self.row2_scene) if has2 else ([], [], [])
+        idx1, colors1, names1, playing1, triggered1 = fetch_clips(has1, self.scroll_scene)
+        idx2, colors2, names2, playing2, triggered2 = (
+            fetch_clips(has2, self.row2_scene) if has2 else ([], [], [], [], [])
+        )
 
         # Scene launch buttons (keys 5 and 10), one per displayed row.
         scene_rows = [self.scroll_scene, self.row2_scene]
@@ -684,19 +746,31 @@ class State:
             else:
                 self.volumes[i], self.mutes[i], self.track_names[i] = 0.0, False, "--"
             self.clip_colors[i], self.clip_names[i] = EMPTY_CLIP_COLOR, ""
+            self.clip_playing[i], self.clip_triggered[i] = False, False
             self.row2_colors[i], self.row2_names[i] = EMPTY_CLIP_COLOR, ""
+            self.row2_playing[i], self.row2_triggered[i] = False, False
 
         for pos, i in enumerate(idx1):
             c = colors1[pos] if pos < len(colors1) else None
             n = names1[pos] if pos < len(names1) else None
+            p = playing1[pos] if pos < len(playing1) else None
+            t = triggered1[pos] if pos < len(triggered1) else None
             self.clip_colors[i] = color_int_to_rgb(c[2]) if c and len(c) >= 3 else EMPTY_CLIP_COLOR
             self.clip_names[i] = n[2] if n and len(n) >= 3 else ""
+            self.clip_playing[i] = bool(p and len(p) >= 3 and p[2])
+            self.clip_triggered[i] = bool(t and len(t) >= 3 and t[2])
 
         for pos, i in enumerate(idx2):
             c = colors2[pos] if pos < len(colors2) else None
             n = names2[pos] if pos < len(names2) else None
+            p = playing2[pos] if pos < len(playing2) else None
+            t = triggered2[pos] if pos < len(triggered2) else None
             self.row2_colors[i] = color_int_to_rgb(c[2]) if c and len(c) >= 3 else EMPTY_CLIP_COLOR
             self.row2_names[i] = n[2] if n and len(n) >= 3 else ""
+            self.row2_playing[i] = bool(p and len(p) >= 3 and p[2])
+            self.row2_triggered[i] = bool(t and len(t) >= 3 and t[2])
+
+        self.recompute_scene_activity()
 
 
 class StripPainter:
@@ -751,7 +825,77 @@ class StripPainter:
                     print(f"[strip {zone}] {e}")
 
 
-def make_handler(state: State, io: DeviceIO, strip: StripPainter, midi: MidiBridge):
+class KeyPainter:
+    """Repaints clip/scene keys on the same bounded-schedule pattern as
+    StripPainter, instead of writing straight from whichever thread noticed
+    a change. Buttons pressed on the HID thread and clip-state updates
+    arriving on the OSC listener thread both used to call a synchronous,
+    locked device write directly -- contending with this same lock against
+    the strip's own ~50/s background writes, which delayed the HID thread
+    from reading the *next* button press. Marking dirty and letting one
+    background thread own every key write removes that contention."""
+
+    ALL_KEYS = (tuple(ROW1_KEY_TO_LOGICAL.values()) + tuple(ROW2_KEY_TO_LOGICAL.values())
+                + (SCENE_KEY_LOGICAL["top5"], SCENE_KEY_LOGICAL["bot5"]))
+
+    def __init__(self, io: DeviceIO, state: State):
+        self.io = io
+        self.state = state
+        self._dirty = set()
+        self._lock = threading.Lock()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def mark(self, *logical_keys):
+        with self._lock:
+            self._dirty.update(logical_keys or self.ALL_KEYS)
+
+    def _render(self, logical_key, blink_on):
+        s = self.state
+        if logical_key in ROW1_LOGICAL_TO_COL:
+            col = ROW1_LOGICAL_TO_COL[logical_key]
+            color = clip_key_color(s.clip_colors[col], s.clip_playing[col],
+                                   s.clip_triggered[col], blink_on, EMPTY_CLIP_COLOR)
+            return color, s.clip_names[col]
+        if logical_key in ROW2_LOGICAL_TO_COL:
+            col = ROW2_LOGICAL_TO_COL[logical_key]
+            color = clip_key_color(s.row2_colors[col], s.row2_playing[col],
+                                   s.row2_triggered[col], blink_on, EMPTY_CLIP_COLOR)
+            return color, s.row2_names[col]
+        idx = 0 if logical_key == SCENE_KEY_LOGICAL["top5"] else 1
+        color = clip_key_color(s.scene_colors[idx], s.scene_playing[idx],
+                               s.scene_triggered[idx], blink_on)
+        return color, s.scene_names[idx]
+
+    def _triggered_keys(self):
+        s = self.state
+        keys = {logical for col, logical in COL_TO_ROW1_LOGICAL.items() if s.clip_triggered[col]}
+        keys |= {logical for col, logical in COL_TO_ROW2_LOGICAL.items() if s.row2_triggered[col]}
+        if s.scene_triggered[0]:
+            keys.add(SCENE_KEY_LOGICAL["top5"])
+        if s.scene_triggered[1]:
+            keys.add(SCENE_KEY_LOGICAL["bot5"])
+        return keys
+
+    def _loop(self):
+        while True:
+            time.sleep(STRIP_FRAME_INTERVAL)
+            # A triggered key keeps blinking every frame even if nothing else
+            # marked it dirty this cycle -- otherwise the animation would
+            # freeze on whatever phase it happened to be at when last drawn.
+            blink_on = int(time.time() * BLINK_HZ * 2) % 2 == 0
+            with self._lock:
+                self._dirty.update(self._triggered_keys())
+                keys, self._dirty = sorted(self._dirty), set()
+            for logical_key in keys:
+                try:
+                    color, text = self._render(logical_key, blink_on)
+                    self.io.write_clip_key(logical_key, color, text)
+                except Exception as e:
+                    print(f"[key {logical_key}] {e}")
+
+
+def make_handler(state: State, io: DeviceIO, strip: StripPainter,
+                 keys: KeyPainter, midi: MidiBridge):
     def push_ring():
         """Fire-and-forget, sent the instant the window moves. Previously this
         rode along at the end of refresh_all, so the ring waited out the
@@ -765,15 +909,9 @@ def make_handler(state: State, io: DeviceIO, strip: StripPainter, midi: MidiBrid
 
     def refresh_all():
         state.refresh_page()
-        for name, logical in ROW1_KEY_TO_LOGICAL.items():
-            col = ROW1_KEY_TO_COLUMN[name]
-            io.write_clip_key(logical, state.clip_colors[col], state.clip_names[col])
-        for name, logical in ROW2_KEY_TO_LOGICAL.items():
-            col = ROW2_KEY_TO_COLUMN[name]
-            io.write_clip_key(logical, state.row2_colors[col], state.row2_names[col])
-        io.write_clip_key(SCENE_KEY_LOGICAL["top5"], state.scene_colors[0], state.scene_names[0])
-        io.write_clip_key(SCENE_KEY_LOGICAL["bot5"], state.scene_colors[1], state.scene_names[1])
+        keys.mark()
         strip.mark()
+        sync_clip_listeners()
         sync_volume_listeners()
         push_ring()
 
@@ -845,6 +983,10 @@ def make_handler(state: State, io: DeviceIO, strip: StripPainter, midi: MidiBrid
             for prop in METER_PROPS:
                 state.osc.send(f"/live/track/stop_listen/{prop}", [tid])
         volume_subs.clear()
+        for tid in clip_track_subs:
+            state.osc.send("/live/track/stop_listen/playing_slot_index", [tid])
+            state.osc.send("/live/track/stop_listen/fired_slot_index", [tid])
+        clip_track_subs.clear()
         state.osc.send("/live/view/stop_listen/selected_track", [])
         state.osc.send("/live/view/stop_listen/selected_scene", [])
 
@@ -876,6 +1018,74 @@ def make_handler(state: State, io: DeviceIO, strip: StripPainter, midi: MidiBrid
     on_meter_left_changed = make_meter_handler(state.meters_l)
     on_meter_right_changed = make_meter_handler(state.meters_r)
 
+    # Live clip play-state subscriptions, one per currently visible TRACK
+    # (not per slot -- clip_slot.is_playing/is_triggered turned out not to
+    # support listening in Live's API at all, confirmed empirically; but
+    # track.playing_slot_index/fired_slot_index do, and are actually a
+    # cleaner fit: comparing the returned scene index to whichever row
+    # we're showing tells us if that row's clip is playing, for free,
+    # with a quarter of the subscriptions). This is a live-update path
+    # only -- refresh_page()'s one-shot has_clip/is_playing/is_triggered
+    # queries (which DO work as plain gets) remain the source of truth on
+    # every full refresh; this just closes the gap between refreshes.
+    clip_track_subs = set()   # {track_id, ...} currently subscribed
+    track_slot_state = {}     # track_id -> {"playing": int, "fired": int}
+
+    def sync_clip_listeners():
+        wanted = set(state.track_ids())
+        for tid in clip_track_subs - wanted:
+            state.osc.send("/live/track/stop_listen/playing_slot_index", [tid])
+            state.osc.send("/live/track/stop_listen/fired_slot_index", [tid])
+            track_slot_state.pop(tid, None)
+        for tid in wanted - clip_track_subs:
+            state.osc.send("/live/track/start_listen/playing_slot_index", [tid])
+            state.osc.send("/live/track/start_listen/fired_slot_index", [tid])
+        clip_track_subs.clear()
+        clip_track_subs.update(wanted)
+
+    def apply_track_slot_state(tid):
+        st = track_slot_state.get(tid, {})
+        playing_idx = st.get("playing", -2)
+        fired_idx = st.get("fired", -1)
+        scene_activity_changed = False
+        for col, t in enumerate(state.track_ids()):
+            if t != tid:
+                continue
+            playing1 = playing_idx == state.scroll_scene
+            triggered1 = fired_idx == state.scroll_scene
+            if state.clip_playing[col] != playing1 or state.clip_triggered[col] != triggered1:
+                state.clip_playing[col] = playing1
+                state.clip_triggered[col] = triggered1
+                keys.mark(COL_TO_ROW1_LOGICAL[col])
+                scene_activity_changed = True
+            playing2 = playing_idx == state.row2_scene
+            triggered2 = fired_idx == state.row2_scene
+            if state.row2_playing[col] != playing2 or state.row2_triggered[col] != triggered2:
+                state.row2_playing[col] = playing2
+                state.row2_triggered[col] = triggered2
+                keys.mark(COL_TO_ROW2_LOGICAL[col])
+                scene_activity_changed = True
+        if scene_activity_changed:
+            prev_scene_playing = list(state.scene_playing)
+            prev_scene_triggered = list(state.scene_triggered)
+            state.recompute_scene_activity()
+            if state.scene_playing[0] != prev_scene_playing[0] or state.scene_triggered[0] != prev_scene_triggered[0]:
+                keys.mark(SCENE_KEY_LOGICAL["top5"])
+            if state.scene_playing[1] != prev_scene_playing[1] or state.scene_triggered[1] != prev_scene_triggered[1]:
+                keys.mark(SCENE_KEY_LOGICAL["bot5"])
+
+    def make_track_slot_handler(key):
+        def handler(*args):
+            if len(args) < 2:
+                return
+            tid, value = args[0], args[1]
+            track_slot_state.setdefault(tid, {})[key] = value
+            apply_track_slot_state(tid)
+        return handler
+
+    on_playing_slot_changed = make_track_slot_handler("playing")
+    on_fired_slot_changed = make_track_slot_handler("fired")
+
     def on_scene_selected(scene_index):
         if scene_index == state.scroll_scene:
             return
@@ -901,11 +1111,26 @@ def make_handler(state: State, io: DeviceIO, strip: StripPainter, midi: MidiBrid
             if col < len(ids):
                 state.osc.send("/live/clip/fire", [ids[col], state.scroll_scene])
                 print(f"[fire] track {ids[col] + 1}, scene {state.scroll_scene + 1}")
+                if state.clip_colors[col] != EMPTY_CLIP_COLOR:
+                    # Optimistic: light up immediately rather than waiting for
+                    # the listener round-trip. The listener corrects this
+                    # shortly after if firing didn't actually start playback.
+                    state.clip_playing[col] = True
+                    state.clip_triggered[col] = False
+                    keys.mark(COL_TO_ROW1_LOGICAL[col])
+                    state.recompute_scene_activity()
+                    keys.mark(SCENE_KEY_LOGICAL["top5"])
         elif name in ROW2_KEY_TO_COLUMN:
             col = ROW2_KEY_TO_COLUMN[name]
             if col < len(ids):
                 state.osc.send("/live/clip/fire", [ids[col], state.row2_scene])
                 print(f"[fire] track {ids[col] + 1}, scene {state.row2_scene + 1}")
+                if state.row2_colors[col] != EMPTY_CLIP_COLOR:
+                    state.row2_playing[col] = True
+                    state.row2_triggered[col] = False
+                    keys.mark(COL_TO_ROW2_LOGICAL[col])
+                    state.recompute_scene_activity()
+                    keys.mark(SCENE_KEY_LOGICAL["bot5"])
 
     def on_knob_rotate(knob, direction):
         if knob in VOLUME_KNOBS:
@@ -1016,7 +1241,7 @@ def make_handler(state: State, io: DeviceIO, strip: StripPainter, midi: MidiBrid
 
     return (raw_callback, refresh_all, on_track_selected, on_scene_selected,
             on_volume_changed, on_meter_left_changed, on_meter_right_changed,
-            stop_all_listeners)
+            on_playing_slot_changed, on_fired_slot_changed, stop_all_listeners)
 
 
 def main():
@@ -1044,11 +1269,13 @@ def main():
     state = State(osc)
     io = DeviceIO(device)
     strip = StripPainter(io, state)
+    keys = KeyPainter(io, state)
     midi = MidiBridge()
 
     (handler, refresh_all, on_track_selected, on_scene_selected,
      on_volume_changed, on_meter_left_changed, on_meter_right_changed,
-     stop_all_listeners) = make_handler(state, io, strip, midi)
+     on_playing_slot_changed, on_fired_slot_changed,
+     stop_all_listeners) = make_handler(state, io, strip, keys, midi)
     device.set_raw_read_callback(handler, async_run=False)
 
     # SIGTERM (plain `kill`, as opposed to Ctrl+C's SIGINT) does not run
@@ -1066,6 +1293,8 @@ def main():
     osc.add_listener("/live/track/get/volume", on_volume_changed)
     osc.add_listener("/live/track/get/output_meter_left", on_meter_left_changed)
     osc.add_listener("/live/track/get/output_meter_right", on_meter_right_changed)
+    osc.add_listener("/live/track/get/playing_slot_index", on_playing_slot_changed)
+    osc.add_listener("/live/track/get/fired_slot_index", on_fired_slot_changed)
 
     try:
         refresh_all()
