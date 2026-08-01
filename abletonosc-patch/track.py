@@ -89,6 +89,21 @@ class TrackHandler(AbletonOSCHandler):
             self.osc_server.add_handler("/live/track/stop_listen/%s" % prop,
                                         create_track_callback(self._stop_mixer_listen, prop, include_track_id=True))
 
+        #--------------------------------------------------------------------------------
+        # Added for the Mirabox N4 bridge: Live's own formatted volume readout
+        # (e.g. "-6.0 dB"). Asking Live avoids reimplementing its non-linear
+        # fader curve, so 0.0 dB lands exactly where Live puts it.
+        #--------------------------------------------------------------------------------
+        def track_get_volume_string(track, params: Tuple[Any] = ()):
+            parameter = track.mixer_device.volume
+            try:
+                return (parameter.str_for_value(parameter.value),)
+            except (AttributeError, RuntimeError):
+                return ("",)
+
+        self.osc_server.add_handler("/live/track/get/volume_string",
+                                    create_track_callback(track_get_volume_string))
+
         # Still need to fix these
         # Might want to find a better approach that unifies volume and sends
         def track_get_send(track, params: Tuple[Any] = ()):

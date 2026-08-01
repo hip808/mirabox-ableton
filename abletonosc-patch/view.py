@@ -35,6 +35,25 @@ class ViewHandler(AbletonOSCHandler):
             self.song.view.select_device(device)
             return params[0], params[1]
 
+        #--------------------------------------------------------------------------------
+        # Added for the Mirabox N4 bridge: draws Live's control surface ring
+        # (the coloured box Push/APC-style controllers project onto Session
+        # view) so the hardware's current 4x2 clip window is visible in Live.
+        # Params: track_offset, scene_offset, width, height [, include_returns]
+        #--------------------------------------------------------------------------------
+        def set_session_highlight(params: Optional[Tuple] = ()):
+            track_offset, scene_offset, width, height = (int(p) for p in params[:4])
+            include_returns = bool(params[4]) if len(params) > 4 else False
+            try:
+                self.manager._set_session_highlight(
+                    track_offset, scene_offset, width, height, include_returns)
+            except AttributeError:
+                self.manager._c_instance.set_session_highlight(
+                    track_offset, scene_offset, width, height, include_returns)
+
+        self.osc_server.add_handler("/live/view/set/session_highlight",
+                                    set_session_highlight)
+
         self.osc_server.add_handler("/live/view/get/selected_scene", get_selected_scene)
         self.osc_server.add_handler("/live/view/get/selected_track", get_selected_track)
         self.osc_server.add_handler("/live/view/get/selected_clip", get_selected_clip)
