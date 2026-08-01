@@ -667,6 +667,14 @@ class State:
         return [self.base + i for i in range(KEY_COLUMNS) if self.base + i < self.num_tracks]
 
     def refresh_page(self):
+        t_start = time.time()
+
+        def lap(label, t0):
+            elapsed = (time.time() - t0) * 1000
+            if elapsed > 20:
+                print(f"[refresh timing] {label}: {elapsed:.0f}ms")
+            return time.time()
+
         # Re-read the set's dimensions every time. Reading these only at
         # startup meant added tracks/scenes -- or loading a different set --
         # left the cursors clamped to stale limits.
@@ -674,6 +682,7 @@ class State:
             ("/live/song/get/num_tracks", []),
             ("/live/song/get/num_scenes", []),
         ])
+        t_prev = lap("counts", t_start)
         if counts[0] and len(counts[0]) >= 1:
             self.num_tracks = counts[0][0]
         if counts[1] and len(counts[1]) >= 1:
@@ -688,16 +697,21 @@ class State:
         # All queries for all columns fire concurrently; doing these one at a
         # time is what made navigation feel unusable.
         vols = self.osc.query_many([("/live/track/get/volume", [t]) for t in ids]) if ids else []
+        t_prev = lap("vols", t_prev)
         names = self.osc.query_many([("/live/track/get/name", [t]) for t in ids]) if ids else []
+        t_prev = lap("names", t_prev)
         mutes = self.osc.query_many([("/live/track/get/mute", [t]) for t in ids]) if ids else []
+        t_prev = lap("mutes", t_prev)
         has1 = self.osc.query_many(
             [("/live/clip_slot/get/has_clip", [t, self.scroll_scene]) for t in ids]
         ) if ids else []
+        t_prev = lap("has1", t_prev)
         has2 = self.osc.query_many(
             [("/live/clip_slot/get/has_clip", [t, self.row2_scene]) for t in ids]
         ) if ids and self.row2_scene != self.scroll_scene else []
+        t_prev = lap("has2", t_prev)
 
-        def fetch_clips(has, scene):
+        def fetch_clips(has, scene, tag, t_prev):
             idx, creqs, nreqs, preqs, treqs = [], [], [], [], []
             for i, tid in enumerate(ids):
                 h = has[i] if i < len(has) else None
@@ -708,15 +722,22 @@ class State:
                     preqs.append(("/live/clip_slot/get/is_playing", [tid, scene]))
                     treqs.append(("/live/clip_slot/get/is_triggered", [tid, scene]))
             colors = self.osc.query_many(creqs) if creqs else []
+            t_prev = lap(f"{tag} colors", t_prev)
             cnames = self.osc.query_many(nreqs) if nreqs else []
+            t_prev = lap(f"{tag} names", t_prev)
             playing = self.osc.query_many(preqs) if preqs else []
+            t_prev = lap(f"{tag} playing", t_prev)
             triggered = self.osc.query_many(treqs) if treqs else []
-            return idx, colors, cnames, playing, triggered
+            t_prev = lap(f"{tag} triggered", t_prev)
+            return idx, colors, cnames, playing, triggered, t_prev
 
-        idx1, colors1, names1, playing1, triggered1 = fetch_clips(has1, self.scroll_scene)
-        idx2, colors2, names2, playing2, triggered2 = (
-            fetch_clips(has2, self.row2_scene) if has2 else ([], [], [], [], [])
-        )
+        idx1, colors1, names1, playing1, triggered1, t_prev = fetch_clips(
+            has1, self.scroll_scene, "row1", t_prev)
+        if has2:
+            idx2, colors2, names2, playing2, triggered2, t_prev = fetch_clips(
+                has2, self.row2_scene, "row2", t_prev)
+        else:
+            idx2, colors2, names2, playing2, triggered2 = [], [], [], [], []
 
         # Scene launch buttons (keys 5 and 10), one per displayed row.
         scene_rows = [self.scroll_scene, self.row2_scene]
@@ -724,6 +745,7 @@ class State:
             [("/live/scene/get/name", [s]) for s in scene_rows]
             + [("/live/scene/get/color", [s]) for s in scene_rows]
         )
+        t_prev = lap("scene_reply", t_prev)
         for i, scene_id in enumerate(scene_rows):
             nm = scene_reply[i]
             cl = scene_reply[i + len(scene_rows)]
@@ -771,6 +793,9 @@ class State:
             self.row2_triggered[i] = bool(t and len(t) >= 3 and t[2])
 
         self.recompute_scene_activity()
+        total = (time.time() - t_start) * 1000
+        if total > 100:
+            print(f"[refresh timing] TOTAL: {total:.0f}ms")
 
 
 class StripPainter:
