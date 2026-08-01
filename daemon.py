@@ -667,6 +667,27 @@ class State:
         return [self.base + i for i in range(KEY_COLUMNS) if self.base + i < self.num_tracks]
 
     def refresh_page(self):
+        """AbletonOSC only answers once per Live's own Remote Script
+        scheduler tick (~100ms), no matter how many messages arrive within
+        that window -- confirmed empirically (every stage below cost the
+        same ~100ms whether it held 2 requests or 11). So the real latency
+        cost is the *number of sequential round trips*, not their size.
+        This does it in two: one for everything that doesn't depend on
+        this call's own results (dimensions, per-column track props,
+        has_clip, scene props), and a second for clip color/name/playing
+        /triggered -- which can only be requested once has_clip says which
+        slots are non-empty. Previously this was ~14 sequential round
+        trips (one per property per row) and took ~1.5s; this cuts it to
+        ~200ms.
+
+        The track/scene window used to build round 1's requests comes
+        from the *previous* refresh's counts, not this call's fresh ones
+        (those arrive in the same round trip, too late to gate it) --
+        harmless staleness, since num_tracks/num_scenes only actually
+        change when tracks/scenes are added or removed in Live, and any
+        request for a since-removed id just times out that one slot
+        without blocking the rest of the batch.
+        """
         t_start = time.time()
 
         def lap(label, t0):
@@ -675,86 +696,85 @@ class State:
                 print(f"[refresh timing] {label}: {elapsed:.0f}ms")
             return time.time()
 
-        # Re-read the set's dimensions every time. Reading these only at
-        # startup meant added tracks/scenes -- or loading a different set --
-        # left the cursors clamped to stale limits.
-        counts = self.osc.query_many([
-            ("/live/song/get/num_tracks", []),
-            ("/live/song/get/num_scenes", []),
-        ])
-        t_prev = lap("counts", t_start)
+        ids = self.track_ids()
+        scroll_scene = self.scroll_scene
+        row2_scene = min(scroll_scene + 1, max(0, self.num_scenes - 1))
+        need_row2 = row2_scene != scroll_scene
+        scene_rows = [scroll_scene, row2_scene]
+
+        reqs1 = [("/live/song/get/num_tracks", []), ("/live/song/get/num_scenes", [])]
+        reqs1 += [("/live/track/get/volume", [t]) for t in ids]
+        reqs1 += [("/live/track/get/name", [t]) for t in ids]
+        reqs1 += [("/live/track/get/mute", [t]) for t in ids]
+        reqs1 += [("/live/clip_slot/get/has_clip", [t, scroll_scene]) for t in ids]
+        if need_row2:
+            reqs1 += [("/live/clip_slot/get/has_clip", [t, row2_scene]) for t in ids]
+        reqs1 += [("/live/scene/get/name", [s]) for s in scene_rows]
+        reqs1 += [("/live/scene/get/color", [s]) for s in scene_rows]
+
+        replies1 = self.osc.query_many(reqs1)
+        t_prev = lap("round1", t_start)
+
+        i = 0
+        counts = replies1[i:i + 2]; i += 2
+        vols = replies1[i:i + len(ids)]; i += len(ids)
+        names = replies1[i:i + len(ids)]; i += len(ids)
+        mutes = replies1[i:i + len(ids)]; i += len(ids)
+        has1 = replies1[i:i + len(ids)]; i += len(ids)
+        has2 = []
+        if need_row2:
+            has2 = replies1[i:i + len(ids)]; i += len(ids)
+        scene_name_reply = replies1[i:i + len(scene_rows)]; i += len(scene_rows)
+        scene_color_reply = replies1[i:i + len(scene_rows)]; i += len(scene_rows)
+
         if counts[0] and len(counts[0]) >= 1:
             self.num_tracks = counts[0][0]
         if counts[1] and len(counts[1]) >= 1:
             self.num_scenes = counts[1][0]
-
         self.base = max(0, min(self.base, max(0, self.num_tracks - 1)))
         self.scroll_scene = max(0, min(self.scroll_scene, max(0, self.num_scenes - 1)))
-
         self.row2_scene = min(self.scroll_scene + 1, max(0, self.num_scenes - 1))
-        ids = self.track_ids()
 
-        # All queries for all columns fire concurrently; doing these one at a
-        # time is what made navigation feel unusable.
-        vols = self.osc.query_many([("/live/track/get/volume", [t]) for t in ids]) if ids else []
-        t_prev = lap("vols", t_prev)
-        names = self.osc.query_many([("/live/track/get/name", [t]) for t in ids]) if ids else []
-        t_prev = lap("names", t_prev)
-        mutes = self.osc.query_many([("/live/track/get/mute", [t]) for t in ids]) if ids else []
-        t_prev = lap("mutes", t_prev)
-        has1 = self.osc.query_many(
-            [("/live/clip_slot/get/has_clip", [t, self.scroll_scene]) for t in ids]
-        ) if ids else []
-        t_prev = lap("has1", t_prev)
-        has2 = self.osc.query_many(
-            [("/live/clip_slot/get/has_clip", [t, self.row2_scene]) for t in ids]
-        ) if ids and self.row2_scene != self.scroll_scene else []
-        t_prev = lap("has2", t_prev)
+        for i2, scene_id in enumerate(scene_rows):
+            nm = scene_name_reply[i2]
+            cl = scene_color_reply[i2]
+            label = nm[1] if nm and len(nm) >= 2 and nm[1] else f"Scene {scene_id + 1}"
+            self.scene_names[i2] = label
+            self.scene_colors[i2] = (
+                color_int_to_rgb(cl[1]) if cl and len(cl) >= 2 and cl[1]
+                else SCENE_DEFAULT_COLOR
+            )
 
-        def fetch_clips(has, scene, tag, t_prev):
+        def build_clip_reqs(has, scene):
             idx, creqs, nreqs, preqs, treqs = [], [], [], [], []
-            for i, tid in enumerate(ids):
-                h = has[i] if i < len(has) else None
+            for pos, tid in enumerate(ids):
+                h = has[pos] if pos < len(has) else None
                 if h and len(h) >= 3 and h[2]:
-                    idx.append(i)
+                    idx.append(pos)
                     creqs.append(("/live/clip/get/color", [tid, scene]))
                     nreqs.append(("/live/clip/get/name", [tid, scene]))
                     preqs.append(("/live/clip_slot/get/is_playing", [tid, scene]))
                     treqs.append(("/live/clip_slot/get/is_triggered", [tid, scene]))
-            colors = self.osc.query_many(creqs) if creqs else []
-            t_prev = lap(f"{tag} colors", t_prev)
-            cnames = self.osc.query_many(nreqs) if nreqs else []
-            t_prev = lap(f"{tag} names", t_prev)
-            playing = self.osc.query_many(preqs) if preqs else []
-            t_prev = lap(f"{tag} playing", t_prev)
-            triggered = self.osc.query_many(treqs) if treqs else []
-            t_prev = lap(f"{tag} triggered", t_prev)
-            return idx, colors, cnames, playing, triggered, t_prev
+            return idx, creqs, nreqs, preqs, treqs
 
-        idx1, colors1, names1, playing1, triggered1, t_prev = fetch_clips(
-            has1, self.scroll_scene, "row1", t_prev)
-        if has2:
-            idx2, colors2, names2, playing2, triggered2, t_prev = fetch_clips(
-                has2, self.row2_scene, "row2", t_prev)
-        else:
-            idx2, colors2, names2, playing2, triggered2 = [], [], [], [], []
-
-        # Scene launch buttons (keys 5 and 10), one per displayed row.
-        scene_rows = [self.scroll_scene, self.row2_scene]
-        scene_reply = self.osc.query_many(
-            [("/live/scene/get/name", [s]) for s in scene_rows]
-            + [("/live/scene/get/color", [s]) for s in scene_rows]
+        idx1, creqs1, nreqs1, preqs1, treqs1 = build_clip_reqs(has1, scroll_scene)
+        idx2, creqs2, nreqs2, preqs2, treqs2 = (
+            build_clip_reqs(has2, row2_scene) if need_row2 else ([], [], [], [], [])
         )
-        t_prev = lap("scene_reply", t_prev)
-        for i, scene_id in enumerate(scene_rows):
-            nm = scene_reply[i]
-            cl = scene_reply[i + len(scene_rows)]
-            label = nm[1] if nm and len(nm) >= 2 and nm[1] else f"Scene {scene_id + 1}"
-            self.scene_names[i] = label
-            self.scene_colors[i] = (
-                color_int_to_rgb(cl[1]) if cl and len(cl) >= 2 and cl[1]
-                else SCENE_DEFAULT_COLOR
-            )
+
+        reqs2 = creqs1 + nreqs1 + preqs1 + treqs1 + creqs2 + nreqs2 + preqs2 + treqs2
+        replies2 = self.osc.query_many(reqs2) if reqs2 else []
+        t_prev = lap("round2", t_prev)
+
+        j = 0
+        colors1 = replies2[j:j + len(creqs1)]; j += len(creqs1)
+        names1 = replies2[j:j + len(nreqs1)]; j += len(nreqs1)
+        playing1 = replies2[j:j + len(preqs1)]; j += len(preqs1)
+        triggered1 = replies2[j:j + len(treqs1)]; j += len(treqs1)
+        colors2 = replies2[j:j + len(creqs2)]; j += len(creqs2)
+        names2 = replies2[j:j + len(nreqs2)]; j += len(nreqs2)
+        playing2 = replies2[j:j + len(preqs2)]; j += len(preqs2)
+        triggered2 = replies2[j:j + len(treqs2)]; j += len(treqs2)
 
         for i in range(KEY_COLUMNS):
             if i < len(ids):
