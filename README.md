@@ -1,5 +1,10 @@
 # Mirabox N4 → Ableton Live 12 bridge
 
+[![License: MIT](https://img.shields.io/github/license/hip808/mirabox-ableton)](LICENSE)
+[![Platform: macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20%28Apple%20Silicon%29-lightgrey)](#requirements)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](#requirements)
+[![Unofficial](https://img.shields.io/badge/status-unofficial%2C%20personal%20project-orange)](#)
+
 A direct hardware bridge between a China-region Mirabox N4 and Ableton Live
 12. It bypasses Mirabox's official StreamDock.app entirely — including the
 region lock that forces the stock app into Chinese — by talking to the N4's
@@ -20,8 +25,17 @@ codes — turned out to work unchanged on the N4 Pro too, confirmed
 hands-on. The only N4 Pro-specific addition is knob LED color (see
 Mixing, below); its RGB knobs are otherwise unused by daemon.py.
 
-Personal project, privately hosted. Not affiliated with or endorsed by
-Mirabox or Ableton.
+Personal project, open-sourced under MIT. Not affiliated with or endorsed
+by Mirabox or Ableton.
+
+## Support this project
+
+If this saved you from a region-locked app or gave your N4/N4 Pro more
+Ableton-specific control than the stock firmware ever offered:
+
+- **PayPal:** [paypal.me/hip808](https://paypal.me/hip808)
+- **GitHub Sponsors:** not open yet — the "Sponsor" button on this repo
+  will activate once it is.
 
 ## Purpose
 
@@ -258,7 +272,8 @@ blanking every key/strip image directly via the SDK.
 
 ## Licenses
 
-This project depends on two MIT-licensed projects, not included here:
+This project itself is [MIT licensed](LICENSE). It also depends on two
+other MIT-licensed projects, not included here:
 [StreamDock-Device-SDK](https://github.com/MiraboxSpace/StreamDock-Device-SDK)
 (Mirabox) and [AbletonOSC](https://github.com/ideoforms/AbletonOSC) (Daniel
 Jones). Not affiliated with or endorsed by Mirabox or Ableton.
