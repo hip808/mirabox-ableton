@@ -156,6 +156,16 @@ KEY_COLUMNS = 4
 VOLUME_KNOBS = (1, 2)
 EMPTY_CLIP_COLOR = (25, 25, 25)
 
+# Knob LEDs -- N4 Pro only (base N4 has none; DeviceIO.write_leds() is a
+# silent no-op there since the SDK gates it on feature_option.hasRGBLed).
+# Knobs 1/2 (mixing) mirror that column's own clip color, dimmed on mute
+# with the same factor already used for non-playing clips. Knobs 3/4
+# (track/scene nav) aren't tied to a single color, so they stay a fixed
+# idle tone that reads as "navigation," not "channel."
+KNOB_LED_BRIGHTNESS = 70
+KNOB_LED_IDLE = (30, 34, 46)
+KNOB_LED_MUTE_DIM = 0.10
+
 # Measured ~16 rotation ticks per full mechanical turn of a knob, so one
 # full turn spans 0-100% volume.
 TICKS_PER_FULL_TURN = 16
@@ -428,6 +438,23 @@ class DeviceIO:
 
     def write_strip_zone(self, zone, img):
         self._write(STRIP_ZONE_LOGICAL[zone], img, "strip zone")
+
+    def write_leds(self, colors):
+        """No-op on devices without RGB knobs (StreamDock.set_single_led_color
+        itself checks feature_option.hasRGBLed) -- safe to call unconditionally
+        so this works on both the base N4 and N4 Pro without a device check."""
+        with self._lock:
+            try:
+                self.device.set_single_led_color(colors)
+            except Exception as e:
+                print(f"[led error] {e}")
+
+    def write_led_brightness(self, percent):
+        with self._lock:
+            try:
+                self.device.set_led_brightness(percent)
+            except Exception as e:
+                print(f"[led brightness error] {e}")
 
 
 def split_db_text(db_text, volume):
@@ -827,6 +854,9 @@ class StripPainter:
         self.state = state
         self._dirty = set()
         self._lock = threading.Lock()
+        self._led_colors = [KNOB_LED_IDLE, KNOB_LED_IDLE, KNOB_LED_IDLE, KNOB_LED_IDLE]
+        self.io.write_led_brightness(KNOB_LED_BRIGHTNESS)
+        self.io.write_leds(self._led_colors)
         threading.Thread(target=self._loop, daemon=True).start()
 
     def mark(self, *zones):
@@ -848,6 +878,10 @@ class StripPainter:
                                     [ids[col]], timeout=0.15)
                 if reply and len(reply) >= 2:
                     db_text = str(reply[1])
+            led = s.clip_colors[col]
+            self._led_colors[col] = (
+                dim_color(led, KNOB_LED_MUTE_DIM) if s.mutes[col] else led
+            )
             return render_volume_zone(ch, s.track_names[col], s.volumes[col],
                                       s.mutes[col], meter_l=s.meters_l[col],
                                       meter_r=s.meters_r[col], db_text=db_text,
@@ -863,11 +897,16 @@ class StripPainter:
             time.sleep(STRIP_FRAME_INTERVAL)
             with self._lock:
                 zones, self._dirty = sorted(self._dirty), set()
+            leds_changed = False
             for zone in zones:
                 try:
                     self.io.write_strip_zone(zone, self._render(zone))
+                    if zone in VOLUME_KNOBS:
+                        leds_changed = True
                 except Exception as e:
                     print(f"[strip {zone}] {e}")
+            if leds_changed:
+                self.io.write_leds(self._led_colors)
 
 
 class KeyPainter:

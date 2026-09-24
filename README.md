@@ -10,6 +10,16 @@ N4 into a from-scratch Ableton controller: live clip/scene launching with
 real Session View colors, per-track volume with a genuine dB meter, and
 two-way visual sync back into Live itself.
 
+**Owns two different physical units**, both driven by the same
+`daemon.py`: the original base N4 (China-region, no RGB LEDs, no
+touchscreen digitizer) and a newer N4 Pro (RGB LED knobs, real
+touchscreen digitizer, USB PID `0x1008`/`0x1023` vs. the base N4's). The
+SDK correctly recognizes each as its own device class, and everything the
+base N4 needed reverse-engineered by hand — key/knob/swipe/tap byte
+codes — turned out to work unchanged on the N4 Pro too, confirmed
+hands-on. The only N4 Pro-specific addition is knob LED color (see
+Mixing, below); its RGB knobs are otherwise unused by daemon.py.
+
 Personal project, privately hosted. Not affiliated with or endorsed by
 Mirabox or Ableton.
 
@@ -29,8 +39,9 @@ app; it can be fully quit and never opened again.
   library is arm64-only)
 - Python 3.11+
 - Ableton Live 12
-- A Mirabox N4 (base/China-region model — no RGB LEDs, no touchscreen
-  digitizer; see Known Issues)
+- A Mirabox N4 or N4 Pro (base N4: China-region model, no RGB LEDs, no
+  touchscreen digitizer; N4 Pro: adds RGB knob LEDs and a real
+  touchscreen digitizer — see Known Issues)
 - Python packages: `pillow`, `python-osc`, `python-rtmidi` (`requirements.txt`)
 - [AbletonOSC](https://github.com/ideoforms/AbletonOSC) installed as a Live
   Control Surface, with two files patched (included in this repo — see
@@ -72,6 +83,13 @@ app; it can be fully quit and never opened again.
   the fader's own position on the same dB scale, separate from the meter.
 - The strip also shows channel number, track name, and Live's own
   formatted dB readout for the fader.
+- **N4 Pro only:** knobs 1/2's RGB LEDs mirror that column's own clip
+  color, dimmed to 10% on mute (`KNOB_LED_MUTE_DIM` in `daemon.py`).
+  Knobs 3/4 (navigation) show a fixed idle tone instead, since they
+  aren't tied to a single track. `DeviceIO.write_leds()` is a silent
+  no-op on the base N4 (the SDK itself gates `set_single_led_color` on
+  `feature_option.hasRGBLed`), so this needs no device check in the
+  code and just does nothing there.
 
 **MIDI**
 - Knob 3 and 4 pushes, and all four zones of a strip tap, each send their
@@ -131,10 +149,33 @@ closing the terminal tab outright can still skip cleanup.
 
 ## Known issues
 
-- **Verified on one physical unit.** The exact key/knob/swipe/tap byte
-  codes were measured empirically on one N4. Almost certainly identical
-  on any N4 with the same firmware (it's the same manufactured product),
-  but not confirmed on a second unit.
+- **Verified on two physical units, one of each model.** The exact
+  key/knob/swipe/tap byte codes were measured empirically on one base N4
+  and confirmed working unchanged on one N4 Pro. Almost certainly
+  identical across other units of either model (same manufactured
+  product), but not confirmed beyond these two.
+- **`clear_screen.py` doesn't cover the N4 Pro's 5th secondary screen
+  key.** It writes blanks to logical keys 1–14 (the base N4's 10 keys +
+  4 strip zones); the N4 Pro's 15th key (`_IMAGE_KEY_MAP` logical 15,
+  its extra secondary screen key) is untouched, same as `daemon.py`,
+  which also never addresses it.
+- **N4 Pro's `set_single_led_color([(0,0,0), ...])` doesn't turn the
+  LEDs off** — confirmed empirically with `led_test.py`; they hold the
+  last non-zero color instead. `reset_led_effect()` (untested) is the
+  more likely way to actually blank them. Doesn't affect `daemon.py`,
+  which never sends pure black — `KNOB_LED_IDLE` and every clip color it
+  uses are non-zero.
+- **N4 Pro plays an audible tap sound on touch.** Firmware-level touch
+  feedback the base N4 doesn't have; nothing in this codebase triggers
+  it or has a way to disable it yet (`device.config.supportConfig` may
+  expose it — untested; see `main.py` in the vendor SDK for its
+  `enable_vibration` config example, which suggests other toggles may
+  exist alongside it).
+- **N4 Pro USB enumeration is intermittently flaky** — `DeviceManager
+  .enumerate()` occasionally returns no devices on a perfectly good
+  connection, worked around by just retrying. Not observed on the base
+  N4. Cause unconfirmed; possibly this specific unit, possibly a
+  transport-library quirk specific to the N4 Pro's PID.
 - **macOS Apple Silicon only.** No Windows/Linux support, despite
   Mirabox's own SDK supporting both — untested, not ported.
 - **Exclusive hardware access.** StreamDock.app and this daemon can't run
@@ -165,8 +206,12 @@ closing the terminal tab outright can still skip cleanup.
   order, without touching Terminal.
 - Full packaged `.app` with a menu bar status icon, for sharing with
   non-technical users.
-- Verify hardware codes against a second N4 unit; extend to other Mirabox
-  models (real N4 Pro with touch/RGB, XL, M3).
+- Extend to other Mirabox models (XL, M3).
+- Use the N4 Pro's real touchscreen digitizer (`decode_touch_bar_event`,
+  proper coordinates) instead of the base N4's reverse-engineered swipe
+  hack, and its 5th secondary screen key.
+- Silence or make configurable the N4 Pro's touch-tap sound, if a config
+  option for it exists.
 - Windows/Linux port.
 - Runtime-configurable CC assignments and momentary/latch behavior,
   instead of source constants.
@@ -193,6 +238,23 @@ reverse-engineer the hardware protocol during development (raw HID capture,
 touchscreen behavior tests, MIDI latency checks, meter timing). Not needed
 to run the bridge — kept as documentation and in case the protocol ever
 needs re-verifying (new firmware, a second unit, etc).
+
+Two more, added when the N4 Pro arrived:
+
+- `discover_n4pro.py` — one-shot identification of whatever's plugged
+  in: device class, firmware, `KEY_COUNT`, `feature_option` flags, and
+  the logical→hardware key map. Read-only, no Ableton needed. Useful any
+  time a new unit or model shows up and you want to confirm what the SDK
+  actually sees before trusting it.
+- `led_test.py` — cycles pure red/green/blue/white across all 4 knob
+  LEDs with a long hold on each, to visually confirm the color channels
+  aren't swapped (as opposed to just looking muted through the knob's
+  diffuser, which is a separate, unfixable-in-software effect). No
+  Ableton needed; `StreamDock.app` must be quit first, same as
+  `clear_screen.py`.
+
+Also standalone and independent of Ableton: `clear_screen.py`, for
+blanking every key/strip image directly via the SDK.
 
 ## Licenses
 
